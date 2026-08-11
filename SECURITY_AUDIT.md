@@ -34,13 +34,14 @@ Client identity: **Pepecoin Core v1.1.0.0** (`configure.ac`:
 |------|---------|
 | `src/test/pepecoin_consensus_tests.cpp` | Adversarial monetary-invariant unit tests (subsidy/coinbase/fees/duplicate-inputs/maturity/amount-range). |
 | `src/test/pepecoin_auxpow_adversarial_tests.cpp` | Adversarial AuxPoW tests (chain index, branch length, version encoding, serialization round-trip). |
+| `src/test/pepecoin_economic_attack_tests.cpp` | **Block-level inflation/double-spend/reorg attacks through the real `ProcessNewBlock`→`ConnectBlock` pipeline**, asserting supply is unchanged. |
 | `src/test/pepecoin_timedata_tests.cpp` | Regression test for the network-time clamp (PEP-001). |
 | `qa/rpc-tests/pepecoin_timewarp_poc.py` | Network-facing PoC shape for PEP-001 (regtest only). |
 | `src/timedata.cpp` | **Fix applied** for PEP-001 (see finding). |
 | `src/Makefile.test.include` | Registers the new unit-test files. |
 
 Build: `./autogen.sh && ./configure --with-incompatible-bdb && make` — clean
-build, `test_pepecoin` passes **268/268** suites (253 upstream + 15 new
+build, `test_pepecoin` passes **275/275** suites (253 upstream + 22 new
 adversarial cases). The single applied source fix (`timedata.cpp`) makes the
 new regression test pass and is functionally identical to upstream Dogecoin
 1.14.8+.
@@ -59,16 +60,28 @@ and three deliberately-changed difficulty magic numbers. This makes a
 and it is the backbone of this report.
 
 **No inflation, coinbase-overpayment, double-spend, or value-conservation
-vulnerability was found.** Every monetary invariant traced through to an
-enforcing check, and the two fundamental invariants
+vulnerability was found.** This conclusion was reached by attacking the **full
+current money machine as it actually runs** — provenance-agnostic, i.e. *not*
+excusing code because it matches upstream Bitcoin/Dogecoin, and specifically
+stress-testing whether Pepecoin's unique parameters (unbounded tail emission,
+`MAX_MONEY` smaller than circulating supply, 1-minute blocks, retarget-every-block
+Digishield) make any latent arithmetic reachable. Every monetary invariant
+traced through to an enforcing check, and the two fundamental invariants
 
 * per transaction: `sum(outputs) ≤ sum(inputs)`, `fee = in − out ≥ 0`
 * per block: `coinbase_out ≤ subsidy(height) + Σ fees`
 
-are enforced on every consensus path examined. These were confirmed both by
-source tracing and by adversarial unit tests that attempt to violate them (all
-correctly rejected), and by a live regtest UTXO-conservation / reorg
-round-trip (supply returns exactly to baseline after invalidate/reconsider).
+are enforced on every consensus path examined. This was established three ways:
+(1) source tracing; (2) an **empirical block-level attack campaign** that builds
+adversarial blocks and feeds them through the real `ProcessNewBlock →
+ConnectBlock` pipeline — 12 distinct inflation/double-spend/maturity/reorg
+attacks, **all correctly rejected with supply provably unchanged**; and (3) a
+**2,020-block regtest churn** whose total UTXO value equals cumulative issuance
+**to the koinu**, across every halving boundary and into tail emission. See the
+*Economic-Destruction Attack Campaign* section for the modular-arithmetic proof
+that the one unguarded accumulator (`nFees`) can only ever *reduce* the reward,
+and the quantified bound showing timestamp/difficulty manipulation cannot mint
+beyond the fixed height-indexed schedule.
 
 The audit did find **two confirmed remotely-triggerable, peer-facing defects
 (both MEDIUM, both non-consensus)**:
@@ -602,11 +615,119 @@ subsidy schedule exactly.
 
 ---
 
+## Economic-Destruction Attack Campaign
+
+This section documents the provenance-agnostic assault on the running money
+machine — the answer to *"can PEPE be minted, duplicated, or destroyed?"* — as
+opposed to the differential analysis above. Nothing here was excused for
+matching upstream.
+
+### 1. Empirical block-level attacks (real `ProcessNewBlock` → `ConnectBlock`)
+
+`src/test/pepecoin_economic_attack_tests.cpp` constructs whole adversarial
+blocks, submits them through the actual acceptance pipeline on a regtest chain,
+and after each attack asserts **(a)** the block was rejected, **(b)** the chain
+tip is unchanged, and **(c)** the *entire UTXO set value* (summed by cursor) is
+unchanged. Every one of the following was **rejected with supply intact**:
+
+| # | Attack | Rejecting check |
+|---|--------|-----------------|
+| 1 | coinbase pays `subsidy + 1` | `bad-cb-amount` (`validation.cpp:1997`) |
+| 2 | coinbase pays `1000 × subsidy` | `bad-cb-amount` |
+| 3 | coinbase split into two outputs summing to `subsidy + 1` | `bad-cb-amount` |
+| 4 | coinbase claims `MAX_MONEY` (< supply, > reward) | `bad-cb-amount` |
+| 5 | non-coinbase tx with `outputs > inputs` | `bad-txns-in-belowout` (`:1447`) |
+| 6 | tx with duplicate inputs (spend same coin twice in one tx) | `bad-txns-inputs-duplicate` (`:552`) |
+| 7 | two txs in one block spending the same coinbase | `bad-txns-inputs-missingorspent` (`:1944`) |
+| 8 | coinbase claims a fee no tx paid | `bad-cb-amount` |
+| 9 | coinbase pays `subsidy + realfee + 1` | `bad-cb-amount` |
+| 10 | tx spending an output created **later** in the same block | `bad-txns-inputs-missingorspent` |
+| 11 | block spending its own/immature coinbase | `bad-txns-premature-spend-of-coinbase` (`:1434`) |
+| 12 | **double-spend across a reorg** (spend coinbase, invalidate block, re-spend, then spend again) | second spend rejected `missingorspent` |
+
+A matched honest control (coinbase = `subsidy + realfee`, valid in-order
+intra-block chain, restored coinbase spendable exactly once post-reorg) is
+**accepted**, and supply grows by **exactly the subsidy** (fees are recycled,
+never created). The reorg case explicitly verifies the spent coinbase is
+restored on disconnect and is then spendable **exactly once** — no duplication,
+no burn.
+
+### 2. Regtest supply-conservation churn (2,020 blocks)
+
+A private regtest node was driven from height 0 to 2,020 with continuous
+UTXO churn (self-sends every 25 blocks), crossing **every** regtest halving
+(150/300/450/600/750) and entering **tail emission** (height 900+). Final
+`gettxoutsetinfo.total_amount` equals the independently-computed cumulative
+issuance **exactly**:
+
+```
+end height 2020   actual supply 158366250.00000000 PEPE
+                  expected issuance 158366250       PEPE   →  MATCH (0 koinu drift)
+```
+
+Combined with the earlier connect→invalidate→reconsider round-trip (supply and
+serialized UTXO hash return bit-for-bit to baseline), the supply invariant holds
+across creation, spending, and deep reorg.
+
+### 3. The one unguarded accumulator (`nFees`) — proof it cannot mint
+
+`ConnectBlock` accumulates `nFees += GetValueIn(tx) − GetValueOut(tx)`
+(`validation.cpp:1974`) with **no per-iteration `MoneyRange` guard**. This is the
+single most suspicious spot given Pepecoin's supply can exceed `INT64_MAX` koinu.
+It is nonetheless **not an inflation vector**, by a modular-arithmetic argument:
+
+* Every addend is a per-transaction fee that `Consensus::CheckTxInputs`
+  independently validates to be `≥ 0` and `≤ MAX_MONEY`, with each tx's total
+  input value `≤ MAX_MONEY` and `nValueIn ≥ GetValueOut` (`validation.cpp:1442–1457`).
+  So the *true* fee sum `S = Σ fees ≥ 0`.
+* On two's-complement `int64`, the stored value is `S mod 2⁶⁴` reinterpreted
+  signed `= S − k·2⁶⁴` for some `k ≥ 0` (because `S ≥ 0`). Therefore
+  **`nFees_stored ≤ S` always.**
+* Hence `blockReward = nFees_stored + subsidy ≤ S + subsidy = true_reward`, and
+  the coinbase gate `coinbase_out ≤ blockReward` (`:1997`) enforces
+  `coinbase_out ≤ subsidy + real_fees`. An overflow can only make `blockReward`
+  **smaller** (or negative → coinbase rejected) — a miner-only *loss*, never a mint.
+* Concretely: 10 txs each paying a `1e18`-koinu fee give `S = 1e19 > INT64_MAX`;
+  wrapped signed this is `≈ −8.45e18`, so `blockReward` is negative and any
+  positive coinbase is rejected. And any single tx large enough to matter is
+  itself rejected first by `CheckInputs`, which aborts the whole block and
+  discards the tainted `nFees`.
+
+A `MoneyRange(nFees)` guard is still recommended as defense-in-depth (PEP-003),
+but its absence is provably non-exploitable for inflation.
+
+### 4. Timestamp / difficulty manipulation cannot accelerate emission
+
+Because the subsidy is a pure function of **height** (`pepecoin.cpp:129,142`),
+mining faster only front-loads the fixed per-height schedule — **total minted =
+Σ subsidy(h) is invariant to block timing.** No coin is created beyond
+`subsidy + fees` regardless of how blocks are spaced. Separately, the per-block
+Digishield difficulty drop is hard-clamped: `nModulatedTimespan = 60 +
+(nActual−60)/8` clamped to `[45, 90]` (`pepecoin.cpp:53–56,69–72`), so the
+maximum target increase is `90/60 = 1.5×` (a 33.3% difficulty drop) per block,
+bounded further by `MedianTimePast` and the `+2h` future-time limit. On mainnet
+`fPowAllowMinDifficultyBlocks = false` in **every** params-tree node, so the
+testnet/regtest min-difficulty shortcut cannot leak to mainnet.
+
+### 5. Independent adversarial fan-out (corroboration)
+
+A separate multi-agent attack campaign independently attacked five economic
+surfaces — block conservation, UTXO double-spend/overwrite, reorg accounting,
+subsidy/emission/difficulty, and amount serialization/compression — with each
+finding **adversarially verified**. Result: **zero economically-destructive
+findings**, with the exact enforcing code cited for **24 refuted attack
+vectors** (folded into the proof-of-absence table above). Notable confirmations:
+`CompressAmount`/`DecompressAmount` is an exact bijection over `[0, MAX_MONEY]`
+and is on-disk only (never on the wire); `DisconnectBlock` aborts the reorg on
+any undo inconsistency rather than continuing with corrupted state; and
+`ApplyTxInUndo`'s three overwrite/missing/available guards plus the
+`*outs != outsBlock` equality check prevent coin resurrection.
+
 ## Testing performed
 
-* **Unit tests:** full `test_pepecoin` suite passes **268/268** (253 upstream +
-  15 new adversarial cases across monetary invariants, AuxPoW, and network
-  time).
+* **Unit tests:** full `test_pepecoin` suite passes **275/275** (253 upstream +
+  22 new adversarial cases across monetary invariants, block-level inflation /
+  double-spend / reorg attacks, AuxPoW, and network time).
 * **Functional tests (regtest):** `auxpow.py`, `getauxblock.py`,
   `createauxblock.py`, `p2p-fullblocktest.py`, `invalidblockrequest.py`,
   `invalidtxrequest.py`, `reindex.py`, `invalidateblock.py`, `mempool_reorg.py`,
@@ -646,11 +767,12 @@ subsidy schedule exactly.
 ./configure --with-incompatible-bdb --disable-bench --without-gui
 make -j"$(nproc)"
 
-# Adversarial consensus + AuxPoW + timedata regression tests
+# Adversarial consensus + block-level economic attacks + AuxPoW + timedata
 ./src/test/test_pepecoin --run_test=pepecoin_consensus_tests
+./src/test/test_pepecoin --run_test=pepecoin_economic_attack_tests
 ./src/test/test_pepecoin --run_test=pepecoin_auxpow_adversarial_tests
 ./src/test/test_pepecoin --run_test=pepecoin_timedata_tests   # passes post-fix
 
-# Full suite
+# Full suite (275/275)
 ./src/test/test_pepecoin
 ```
