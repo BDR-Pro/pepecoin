@@ -70,12 +70,21 @@ source tracing and by adversarial unit tests that attempt to violate them (all
 correctly rejected), and by a live regtest UTXO-conservation / reorg
 round-trip (supply returns exactly to baseline after invalidate/reconsider).
 
-The audit did find **one confirmed remotely-triggerable defect (MEDIUM)**: the
-network-adjusted-time clamp in `timedata.cpp` uses `abs64()`, which is
-undefined behavior on `INT64_MIN` and lets hostile peers push the node's time
-offset past the `±maxtimeadjustment` clamp it is designed to enforce. This is
-the reintroduction of a bug that upstream Dogecoin explicitly fixed in 1.14.8.
-A regression test and the upstream-equivalent fix are included.
+The audit did find **two confirmed remotely-triggerable, peer-facing defects
+(both MEDIUM, both non-consensus)**:
+
+* **PEP-001** — the network-adjusted-time clamp in `timedata.cpp` uses
+  `abs64()`, which is undefined behavior on `INT64_MIN` and lets hostile peers
+  push the node’s time offset past the `±maxtimeadjustment` clamp it is designed
+  to enforce (reintroduction of a bug Dogecoin fixed in 1.14.8). A regression
+  test and the upstream-equivalent fix are included and applied in this branch.
+* **PEP-005** — `net_processing.cpp` is based on Dogecoin 1.14.7 and is missing
+  the 1.14.8/1.14.9 peer-DoS hardening (a forced `getheaders` per INV entry, and
+  `MAX_PEER_TX_ANNOUNCEMENTS` left at 100,000 vs upstream’s 5,000).
+
+Both are network-layer resource-exhaustion issues; neither affects block or
+transaction validity. Per the audit’s severity rubric (node DoS = MEDIUM) they
+are MEDIUM. **No CRITICAL or HIGH monetary/consensus vulnerability exists.**
 
 A small number of lower-severity observations (missing upstream diagnostic
 improvements, latent-but-unreachable arithmetic) are documented, along with an
@@ -87,9 +96,15 @@ investigated and refuted, with the exact enforcing code for each.
 | ID | Severity | Confidence | Status | Title |
 |----|----------|-----------|--------|-------|
 | PEP-001 | MEDIUM | CONFIRMED | Fixed in this branch | `abs64(INT64_MIN)` UB lets peers bypass the network-time clamp |
+| PEP-005 | MEDIUM | CONFIRMED | Open | Missing Dogecoin 1.14.8/1.14.9 P2P hardening (forced getheaders per INV entry; `MAX_PEER_TX_ANNOUNCEMENTS` 100000 vs 5000) — network DoS, non-consensus |
 | PEP-002 | LOW | CONFIRMED | Open | Upstream difficulty-error “masking” fix (`c4e76a369`) not ported (diagnostic only) |
 | PEP-003 | LOW/INFO | CONFIRMED | Open | `MAX_MONEY` is not a supply bound; total emission exceeds `MAX_MONEY` and `INT64_MAX` (handled where it matters) |
-| PEP-004 | INFO | CONFIRMED | Open | Dead / stale consensus code and `//PEPE TODO` magic numbers |
+| PEP-004 | INFO | CONFIRMED | Open | Dead/stale consensus code, inherited latent items, and `//PEPE TODO` magic numbers |
+
+*Scope note:* PEP-001 and PEP-005 are network-layer (peer-facing) issues, not
+consensus/monetary defects. Consistent with the audit’s severity rubric,
+node-DoS issues are rated **MEDIUM**. **No CRITICAL or HIGH monetary/consensus
+vulnerability was found.**
 
 ---
 
@@ -198,6 +213,7 @@ adversarially (finding PEP-INV tests) and hold.
 | Compact blocks | `blockencodings.cpp/.h` | **byte-identical** | assert-hardening (b5dec9637) present |
 | Chain params | `chainparams.cpp` | heavily Pepecoin-specific | audited; consistent |
 | Network time | `timedata.cpp` | **older pre-1.14.8 variant with `abs64`** | **PEP-001** |
+| P2P message handling | `net_processing.cpp` | **based on Dogecoin 1.14.7** (missing 1.14.8/9 hardening) | **PEP-005** (non-consensus DoS) |
 | Fees / policy | `pepecoin-fees.cpp`, `policy/policy.*` | rename only | identical logic |
 
 ---
@@ -237,6 +253,12 @@ The **only** semantic (non-rename) deltas in consensus-critical code are:
 4. **`timedata.cpp`**: Pepecoin ships the **pre-1.14.8** version using
    `abs64()`. Dogecoin replaced this in commit *“Avoid the use of abs64 in
    timedata”* (1.14.8). This is **PEP-001**.
+
+5. **`net_processing.cpp`**: based on **Dogecoin 1.14.7** — the diff is 14 lines
+   vs 1.14.7 but 463 lines vs 1.14.9. The 1.14.8/1.14.9 P2P hardening
+   (`6e74282e2` one-getheaders-per-INV, `c9d9486c8` reduced
+   `MAX_PEER_TX_ANNOUNCEMENTS`, `b961bab13`/`fd72ba453`/`e9128ec21` orphan &
+   header-sync hardening) is **absent**. This is **PEP-005** (non-consensus).
 
 **Upstream security-relevant fixes checked for presence:**
 
@@ -355,6 +377,63 @@ in the 1.14.8 cycle (*“Avoid the use of abs64 in timedata”* / commit
 
 ---
 
+### Finding PEP-005 — Missing Dogecoin 1.14.8/1.14.9 P2P hardening (network DoS)
+
+**Severity:** MEDIUM &nbsp;•&nbsp; **Confidence:** CONFIRMED &nbsp;•&nbsp;
+**Status:** Open &nbsp;•&nbsp; **Class:** Peer-facing DoS (non-consensus)
+
+**Context.** Pepecoin’s `src/net_processing.cpp` is based on **Dogecoin
+1.14.7** (14-line diff vs 1.14.7 vs. 463-line diff vs 1.14.9). It therefore
+lacks the peer-DoS hardening that Dogecoin added in 1.14.8/1.14.9. Two concrete
+gaps were confirmed by source:
+
+**(a) Forced `getheaders` per block entry in an INV** — missing upstream
+`6e74282e2` (*“Only send a getheaders for one block in an INV”*).
+`src/net_processing.cpp:1769`, inside the `for (CInv& inv : vInv)` loop:
+
+```c
+// Pepecoin: We force this check, in case we're only connected to nodes that send invs
+RequestHeadersFrom(pfrom, connman, pindexBestHeader, inv.hash, true);   // fforceQuery = true
+```
+
+Because `fforceQuery = true`, `RequestHeadersFrom` bypasses its own
+`nPendingHeaderRequests > 0` rate-limit and pushes a full-locator `getheaders`
+for **every** unknown block hash in the INV. A single crafted `inv` message can
+carry up to `MAX_INV_SZ = 50,000` fabricated block hashes (all pass
+`!fAlreadyHave`), eliciting up to 50,000 forced `getheaders` — a self-inflicted
+outbound-bandwidth amplification. Upstream 1.14.9 issues **one** `getheaders`
+per INV (using the last unknown hash), outside the loop
+(`net_processing.cpp:1770` there).
+
+**(b) `MAX_PEER_TX_ANNOUNCEMENTS` too large** — missing upstream `c9d9486c8`
+(*“policy: reduce MAX_PEER_TX_ANNOUNCEMENTS”*). `src/net_processing.cpp:55`:
+
+```c
+static constexpr int32_t MAX_PEER_TX_ANNOUNCEMENTS = 2 * MAX_INV_SZ;   // = 100,000
+```
+
+Upstream 1.14.9 sets this to **5,000** (`net_processing.cpp:63`). Pepecoin
+allows a single peer to hold **20×** more pending tx-announcement state
+(`m_tx_announced` / `m_tx_process_time` maps in `CNodeState::TxDownloadState`),
+i.e. bounded per-peer memory growth an order of magnitude above upstream’s
+intended cap.
+
+**Impact.** Remotely-triggerable bandwidth/memory pressure on a node from a
+connected peer. **No consensus effect** — these paths never influence block or
+transaction validity, only resource usage. Rated MEDIUM per the node-DoS rubric.
+
+**Recommended patch.** Cherry-pick `6e74282e2` (hoist the forced `getheaders`
+out of the INV loop, one per message using the last unknown hash) and
+`c9d9486c8` (`MAX_PEER_TX_ANNOUNCEMENTS = 5000`). Both apply cleanly against the
+1.14.7-based file. More broadly, rebasing `net_processing.cpp` onto Dogecoin
+1.14.9 would pick up the full orphan-processing and header-sync hardening set
+(`b961bab13`, `fd72ba453`, `e9128ec21`).
+
+**Upstream Dogecoin comparison.** Both fixes shipped in the Dogecoin 1.14.8 →
+1.14.9 window; Pepecoin forked `net_processing.cpp` before them.
+
+---
+
 ### Finding PEP-002 — Upstream difficulty-error “masking” fix not ported (diagnostic-only)
 
 **Severity:** LOW &nbsp;•&nbsp; **Confidence:** CONFIRMED &nbsp;•&nbsp;
@@ -451,6 +530,27 @@ unbounded supply.
   below) but remains compiled in. Recommend removing to shrink the
   consensus surface.
 
+**Inherited latent items (shared verbatim with upstream Dogecoin — not
+Pepecoin regressions, noted for completeness):**
+
+* `CTxMemPool::removeForReorg` (`txmempool.cpp:556`) reads
+  `coins->nHeight` **before** the `if (!coins || ...)` null-check on the next
+  line — a deref-before-null-check that would crash if `AccessCoins` returned
+  `NULL`. The line is **byte-identical to Dogecoin 1.14.9** (`txmempool.cpp` is
+  a rename-only diff). In practice `coins` is non-NULL here (a mempool tx’s
+  coinbase input is present in the post-reorg view), and the `assert(coins)` is
+  debug-only (`nCheckFrequency != 0`). Recommend reordering the null-check
+  before the deref regardless.
+* `chainTxData` is left empty (`ChainTxData{ }`) on **mainnet**
+  (`chainparams.cpp:187`) and **testnet** (`:318`), so
+  `GuessVerificationProgress` / `getblockchaininfo.verificationprogress`
+  effectively always reports `1.0`. Cosmetic/monitoring only; no consensus or
+  IBD-correctness effect.
+* `getcoincount` is registered in the RPC conversion table
+  (`rpc/client.cpp:134`) under a name that does not match the registered RPC,
+  making the numeric argument un-convertible from `pepecoin-cli`. Non-consensus
+  usability bug.
+
 ---
 
 ## Proof of Absence — hypotheses investigated and refuted
@@ -524,15 +624,18 @@ subsidy schedule exactly.
 ## Recommendations (priority order)
 
 1. **Apply PEP-001** (done in this branch): drop `abs64` in `timedata.cpp`.
-   This is the only change with real security value found.
-2. Port `c4e76a369` (PEP-002) for upstream parity / better error reporting.
-3. Add a `MoneyRange(nFees)` guard in `ConnectBlock` as defense-in-depth given
+   This is the highest-value security change found.
+2. **PEP-005:** cherry-pick the Dogecoin 1.14.8/1.14.9 P2P hardening
+   (`6e74282e2`, `c9d9486c8`, and ideally rebase `net_processing.cpp` onto
+   1.14.9). Reduces peer-facing DoS surface; no consensus risk.
+3. Port `c4e76a369` (PEP-002) for upstream parity / better error reporting.
+4. Add a `MoneyRange(nFees)` guard in `ConnectBlock` as defense-in-depth given
    the unbounded tail emission (PEP-003).
-4. Remove dead consensus scaffolding: the legacy hash-derived subsidy branch
-   and `IsSuperMajority`; resolve the `BIP34Hash = 0x00` TODO deliberately
-   (PEP-004).
-5. Keep tracking the Dogecoin `1.14-maint` branch for future consensus fixes;
-   the fork is close enough that cherry-picks apply cleanly.
+5. Remove dead consensus scaffolding (legacy hash-derived subsidy branch,
+   `IsSuperMajority`); reorder the `removeForReorg` null-check; resolve the
+   `BIP34Hash = 0x00` TODO deliberately (PEP-004).
+6. Keep tracking the Dogecoin `1.14-maint` branch for future fixes; the fork is
+   close enough that cherry-picks apply cleanly.
 
 ---
 
