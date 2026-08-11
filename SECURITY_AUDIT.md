@@ -121,7 +121,16 @@ investigated and refuted, with the exact enforcing code for each.
 | PEP-005 | MEDIUM | CONFIRMED | Open | Missing Dogecoin 1.14.8/1.14.9 P2P hardening (forced getheaders per INV entry; `MAX_PEER_TX_ANNOUNCEMENTS` 100000 vs 5000) — network DoS, non-consensus |
 | PEP-002 | LOW | CONFIRMED | Open | Upstream difficulty-error “masking” fix (`c4e76a369`) not ported (diagnostic only) |
 | PEP-003 | LOW/INFO | CONFIRMED | Open | `MAX_MONEY` is not a supply bound; total emission exceeds `MAX_MONEY` and `INT64_MAX` (handled where it matters) |
+| PEP-006 | MEDIUM (**testnet only**) | CONFIRMED | Open (by-design relaxation) | Testnet `fStrictChainId=false` allows AuxPoW **work-reuse**: one parent-block PoW can validate up to 64 chained blocks → up to 64× hashrate amplification → cheap deep-reorg/double-spend on **testnet**. Mainnet/regtest have `fStrictChainId=true` and are **not** affected. |
 | PEP-004 | INFO | CONFIRMED | Open | Dead/stale consensus code, inherited latent items, and `//PEPE TODO` magic numbers |
+
+**Coin-theft (spend-what-you-don't-own) is closed.** Signature/script verification
+is fully enforced on the connect path (`fScriptChecks=true`, only relaxed under
+assumevalid for ancestors of the assume-valid block). Empirically proven by
+`src/test/pepecoin_theft_tests.cpp`: spending a victim's UTXO with no signature,
+the attacker's signature, garbage bytes, a post-signing tamper, or an attacker
+key against a P2PKH output are **all rejected in a block**; only the legitimately
+signed control is accepted.
 
 *Scope note:* PEP-001 and PEP-005 are network-layer (peer-facing) issues, not
 consensus/monetary defects. Consistent with the audit’s severity rubric,
