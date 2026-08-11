@@ -97,6 +97,9 @@ BITCOIN_TESTS =\
   test/cuckoocache_tests.cpp \
   test/DoS_tests.cpp \
   test/pepecoin_tests.cpp \
+  test/pepecoin_consensus_tests.cpp \
+  test/pepecoin_auxpow_adversarial_tests.cpp \
+  test/pepecoin_timedata_tests.cpp \
   test/getarg_tests.cpp \
   test/hash_tests.cpp \
   test/key_tests.cpp \
