@@ -103,6 +103,7 @@ BITCOIN_TESTS =\
   test/pepecoin_doublespend_tests.cpp \
   test/pepecoin_auxpow_adversarial_tests.cpp \
   test/pepecoin_auxpow_workreuse_tests.cpp \
+  test/pepecoin_timewarp_impact_tests.cpp \
   test/pepecoin_timedata_tests.cpp \
   test/getarg_tests.cpp \
   test/hash_tests.cpp \
