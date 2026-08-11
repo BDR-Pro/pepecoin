@@ -36,7 +36,9 @@ Client identity: **Pepecoin Core v1.1.0.0** (`configure.ac`:
 | `src/test/pepecoin_auxpow_adversarial_tests.cpp` | Adversarial AuxPoW tests (chain index, branch length, version encoding, serialization round-trip). |
 | `src/test/pepecoin_economic_attack_tests.cpp` | **Block-level inflation/double-spend/reorg attacks through the real `ProcessNewBlock`→`ConnectBlock` pipeline**, asserting supply is unchanged. |
 | `src/test/pepecoin_timedata_tests.cpp` | Regression test for the network-time clamp (PEP-001). |
-| `qa/rpc-tests/pepecoin_timewarp_poc.py` | Network-facing PoC shape for PEP-001 (regtest only). |
+| `qa/rpc-tests/pepecoin_timewarp_exploit.py` | **Working end-to-end exploit for PEP-001** — raw-socket P2P client, freezes an isolated regtest node (regtest/loopback only). |
+| `POC_PEP-001_timewarp.md` | Weaponized PEP-001 walkthrough: PoC, impact chain, test, and fix. |
+| `qa/rpc-tests/pepecoin_timewarp_poc.py` | Earlier network-facing PoC shape for PEP-001 (regtest only). |
 | `src/timedata.cpp` | **Fix applied** for PEP-001 (see finding). |
 | `src/Makefile.test.include` | Registers the new unit-test files. |
 
@@ -83,21 +85,28 @@ that the one unguarded accumulator (`nFees`) can only ever *reduce* the reward,
 and the quantified bound showing timestamp/difficulty manipulation cannot mint
 beyond the fixed height-indexed schedule.
 
-The audit did find **two confirmed remotely-triggerable, peer-facing defects
-(both MEDIUM, both non-consensus)**:
+The audit did find **confirmed remotely-triggerable, peer-facing defects**, and
+one of them **weaponizes to HIGH**:
 
-* **PEP-001** — the network-adjusted-time clamp in `timedata.cpp` uses
-  `abs64()`, which is undefined behavior on `INT64_MIN` and lets hostile peers
-  push the node’s time offset past the `±maxtimeadjustment` clamp it is designed
-  to enforce (reintroduction of a bug Dogecoin fixed in 1.14.8). A regression
-  test and the upstream-equivalent fix are included and applied in this branch.
-* **PEP-005** — `net_processing.cpp` is based on Dogecoin 1.14.7 and is missing
-  the 1.14.8/1.14.9 peer-DoS hardening (a forced `getheaders` per INV entry, and
-  `MAX_PEER_TX_ANNOUNCEMENTS` left at 100,000 vs upstream’s 5,000).
+* **PEP-001 (HIGH, weaponized; base MEDIUM)** — the network-adjusted-time clamp
+  in `timedata.cpp` uses `abs64()`, which is undefined behavior on `INT64_MIN`.
+  A **working end-to-end exploit** (`qa/rpc-tests/pepecoin_timewarp_exploit.py`,
+  8 `version` messages from distinct IPs) drives a node’s clock offset to
+  `INT64_MIN`, after which `ContextualCheckBlockHeader` rejects **every** real
+  block as `time-too-new` — the node is **frozen at its tip until restart**, and
+  the attack scales to a network-wide liveness halt. It stops short of CRITICAL
+  because a frozen node accepts *no* chain (no mint, no split, no double-spend).
+  Regression test + upstream-equivalent fix applied in this branch; the fixed
+  binary resists the identical exploit. Full walkthrough: `POC_PEP-001_timewarp.md`.
+* **PEP-005 (MEDIUM)** — `net_processing.cpp` is based on Dogecoin 1.14.7 and is
+  missing the 1.14.8/1.14.9 peer-DoS hardening (a forced `getheaders` per INV
+  entry, and `MAX_PEER_TX_ANNOUNCEMENTS` left at 100,000 vs upstream’s 5,000).
 
-Both are network-layer resource-exhaustion issues; neither affects block or
-transaction validity. Per the audit’s severity rubric (node DoS = MEDIUM) they
-are MEDIUM. **No CRITICAL or HIGH monetary/consensus vulnerability exists.**
+Both are network-layer / availability issues; **neither affects block or
+transaction validity**. **No CRITICAL vulnerability, and no monetary/consensus
+(inflation, coinbase-overpay, double-spend, value-conservation, consensus-split)
+vulnerability of any severity, was found** — the weaponized finding is a
+liveness/DoS escalation, deliberately not dressed up as a monetary break.
 
 A small number of lower-severity observations (missing upstream diagnostic
 improvements, latent-but-unreachable arithmetic) are documented, along with an
@@ -108,7 +117,7 @@ investigated and refuted, with the exact enforcing code for each.
 
 | ID | Severity | Confidence | Status | Title |
 |----|----------|-----------|--------|-------|
-| PEP-001 | MEDIUM | CONFIRMED | Fixed in this branch | `abs64(INT64_MIN)` UB lets peers bypass the network-time clamp |
+| PEP-001 | **HIGH** (base MEDIUM, weaponized) | CONFIRMED (end-to-end PoC) | Fixed in this branch | `abs64(INT64_MIN)` UB → peers freeze a node's clock offset at `INT64_MIN` → node rejects **all** blocks (`time-too-new`) → persistent remote node/network liveness freeze |
 | PEP-005 | MEDIUM | CONFIRMED | Open | Missing Dogecoin 1.14.8/1.14.9 P2P hardening (forced getheaders per INV entry; `MAX_PEER_TX_ANNOUNCEMENTS` 100000 vs 5000) — network DoS, non-consensus |
 | PEP-002 | LOW | CONFIRMED | Open | Upstream difficulty-error “masking” fix (`c4e76a369`) not ported (diagnostic only) |
 | PEP-003 | LOW/INFO | CONFIRMED | Open | `MAX_MONEY` is not a supply bound; total emission exceeds `MAX_MONEY` and `INT64_MAX` (handled where it matters) |
@@ -289,10 +298,25 @@ The **only** semantic (non-rename) deltas in consensus-critical code are:
 
 ## Findings
 
-### Finding PEP-001 — `abs64(INT64_MIN)` lets hostile peers bypass the network-time clamp
+### Finding PEP-001 — `abs64(INT64_MIN)` network-time UB, weaponized to a remote node/network freeze
 
-**Severity:** MEDIUM &nbsp;•&nbsp; **Confidence:** CONFIRMED &nbsp;•&nbsp;
+**Severity:** **HIGH** (base MEDIUM, escalated by working exploit) &nbsp;•&nbsp;
+**Confidence:** CONFIRMED (end-to-end PoC on an isolated regtest node) &nbsp;•&nbsp;
 **Status:** Fixed in this branch (upstream-equivalent patch applied)
+
+> **Weaponization (see `POC_PEP-001_timewarp.md` for the full walkthrough).**
+> 8 hostile `version` messages from distinct loopback IPs, each carrying
+> `nTime = INT64_MIN + node_second`, drive the node's `getnetworkinfo.timeoffset`
+> to `-9223372036854775808` (INT64_MIN). The poisoned `GetAdjustedTime()` then
+> makes `ContextualCheckBlockHeader` reject **every** real-timestamp block as
+> `time-too-new` — the node can neither mine nor accept the honest chain and is
+> **frozen at its tip until restart** (`setKnown` caps at 200 and never evicts,
+> so the poison is sticky). The same attack repeated across listening nodes
+> (miners, exchanges, seeds) is a network-wide block-production/propagation halt.
+> The identical exploit against the fixed binary leaves `timeoffset = 0` and the
+> node keeps mining. **Honest ceiling: HIGH (liveness/DoS), not CRITICAL — a
+> frozen node rejects *all* blocks and never accepts a false chain, so this
+> cannot mint coins, split consensus, or double-spend.**
 
 **File / Function / Lines:** `src/timedata.cpp` — `abs64()` (pre-fix line 41)
 and `AddTimeData()` (pre-fix line 85). Reached from
